@@ -520,14 +520,28 @@ class BatchedInferencePipeline:
         audio_segments = torch.nested.nested_tensor(audio_segments).to_padded_tensor(
             padding=0
         )
-        features = torch.stack(
-            [
-                self.model.feature_extractor(audio_segment, to_cpu=to_cpu)[
-                    ..., : self.model.feature_extractor.nb_max_frames
+        try:
+            features = torch.stack(
+                [
+                    self.model.feature_extractor(audio_segment, to_cpu=to_cpu)[
+                        ..., : self.model.feature_extractor.nb_max_frames
+                    ]
+                    for audio_segment in audio_segments
                 ]
-                for audio_segment in audio_segments
-            ]
-        )
+            )
+        except torch.OutOfMemoryError:
+            self.model.logger.error(
+                "Out of memory error occurred while extracting features. Switching to CPU mode."
+            )
+            torch.cuda.empty_cache()
+            features = torch.stack(
+                [
+                    self.model.feature_extractor(audio_segment, to_cpu=True)[
+                        ..., : self.model.feature_extractor.nb_max_frames
+                    ]
+                    for audio_segment in audio_segments
+                ]
+            )
 
         segments = self._batched_segments_generator(
             features,
