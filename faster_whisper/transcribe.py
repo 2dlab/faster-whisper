@@ -269,6 +269,19 @@ class BatchedInferencePipeline:
             segments_metadata.append(seg_metadata)
         return audio_segments, segments_metadata
 
+    @staticmethod
+    def audio_split_generator(audio, segments, sampling_rate):
+        """Yields splitted audio chunks and their associated metadata."""
+        for seg in segments:
+            f1 = int(seg["start"] * sampling_rate)
+            f2 = int(seg["end"] * sampling_rate)
+            seg_metadata = {
+                "start_time": seg["start"],
+                "end_time": seg["end"],
+                "stitched_seg": seg["segments"],
+            }
+            yield audio[f1:f2], seg_metadata
+
     def load_vad_model(self, vad_onset=0.500, vad_offset=0.363):
         vad_model = Model.from_pretrained(self.vad_model_path)
         hyperparameters = {
@@ -511,41 +524,13 @@ class BatchedInferencePipeline:
             all_language_probs=all_language_probs,
         )
 
-        audio_segments, segments_metadata = self.audio_split(
+        audio_split_generator = self.audio_split_generator(
             audio, vad_segments, sampling_rate
         )
-        to_cpu = (
-            self.model.model.device == "cuda" and len(self.model.model.device_index) > 1
-        )
-        audio_segments = torch.nested.nested_tensor(audio_segments).to_padded_tensor(
-            padding=0
-        )
-        try:
-            features = torch.stack(
-                [
-                    self.model.feature_extractor(audio_segment, to_cpu=to_cpu)[
-                        ..., : self.model.feature_extractor.nb_max_frames
-                    ]
-                    for audio_segment in audio_segments
-                ]
-            )
-        except torch.OutOfMemoryError:
-            self.model.logger.error(
-                "Out of memory error occurred while extracting features. Switching to CPU mode."
-            )
-            torch.cuda.empty_cache()
-            features = torch.stack(
-                [
-                    self.model.feature_extractor(audio_segment, to_cpu=True)[
-                        ..., : self.model.feature_extractor.nb_max_frames
-                    ]
-                    for audio_segment in audio_segments
-                ]
-            )
 
         segments = self._batched_segments_generator(
-            features,
-            segments_metadata,
+            audio_split_generator,
+            vad_segments,
             batch_size,
             batched_options,
             log_progress,
@@ -554,14 +539,34 @@ class BatchedInferencePipeline:
         return segments, info
 
     def _batched_segments_generator(
-        self, features, segments_metadata, batch_size, options, log_progress
+        self, audio_split_generator, vad_segments, batch_size, options, log_progress
     ):
-        pbar = tqdm(total=len(features), disable=not log_progress, position=0)
+        to_cpu = (
+            self.model.model.device == "cuda" and len(self.model.model.device_index) > 1
+        )
+        pbar = tqdm(total=len(vad_segments), disable=not log_progress, position=0)
         seg_idx = 0
-        for i in range(0, len(features), batch_size):
+        for i in range(0, len(vad_segments), batch_size):
+            audio_segments = []
+            segments_metadata = []
+            for audio, seg_metadata in itertools.islice(audio_split_generator, batch_size):
+                audio_segments.append(audio)
+                segments_metadata.append(seg_metadata)
+
+            audio_segments = torch.nested.nested_tensor(audio_segments).to_padded_tensor(
+                padding=0
+            )
+            features = torch.stack(
+                [
+                    self.model.feature_extractor(audio_segment, to_cpu=True)[
+                    ..., : self.model.feature_extractor.nb_max_frames
+                    ]
+                    for audio_segment in audio_segments
+                ]
+            )
             results = self.forward(
-                features[i : i + batch_size],
-                segments_metadata[i : i + batch_size],
+                features,
+                segments_metadata,
                 **options._asdict(),
             )
 
